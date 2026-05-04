@@ -1,0 +1,35 @@
+{
+    "name": "disrex/sample-data-themes-core",
+    "description": "Theme-based sample data framework for Magento 2 / MageOS — pluggable registry, fixture runner, multi-locale support and CLI.",
+    "type": "magento2-module",
+    "license": "MIT",
+    "keywords": [
+        "magento",
+        "magento2",
+        "mageos",
+        "sample-data",
+        "demo-data",
+        "fixtures"
+    ],
+    "require": {
+        "php": "~8.2.0 || ~8.3.0 || ~8.4.0",
+        "magento/framework": "^103.0",
+        "magento/module-catalog": "^104.0",
+        "magento/module-eav": "^102.1",
+        "magento/module-store": "^101.1",
+        "magento/module-config": "^101.2",
+        "magento/module-catalog-inventory": "^100.4"
+    },
+    "suggest": {
+        "magento/module-sample-data": "Hooks the bin/magento sampledata:deploy command so users can opt into themed data.",
+        "disrex/sample-data-theme-home-living": "First-party reference theme: scandinavian home & living catalog (EN/NL)."
+    },
+    "autoload": {
+        "files": [
+            "registration.php"
+        ],
+        "psr-4": {
+            "Disrex\\SampleDataThemesCore\\": ""
+        }
+    }
+}

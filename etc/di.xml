@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+
+    <!--
+        Theme registry. Theme packages extend this <argument> via their own
+        di.xml, e.g.:
+
+            <type name="Disrex\SampleDataThemesCore\Model\ThemeRegistry">
+                <arguments>
+                    <argument name="themes" xsi:type="array">
+                        <item name="home-living" xsi:type="object">
+                            Vendor\Theme\Model\Theme
+                        </item>
+                    </argument>
+                </arguments>
+            </type>
+    -->
+    <type name="Disrex\SampleDataThemesCore\Model\ThemeRegistry">
+        <arguments>
+            <argument name="themes" xsi:type="array"/>
+        </arguments>
+    </type>
+
+    <!--
+        Plugin: when a theme is registered, intercept the stock
+        sampledata:deploy command and offer the themed alternative. The plugin
+        is a no-op when no theme is registered, so installs without theme
+        packages are unaffected.
+    -->
+    <type name="Magento\SampleData\Console\Command\SampleDataDeployCommand">
+        <plugin name="disrex_sample_data_themes_offer_themed"
+                type="Disrex\SampleDataThemesCore\Plugin\SampleDataDeployPlugin"
+                sortOrder="10"/>
+    </type>
+
+    <!--
+        Console commands.
+    -->
+    <type name="Magento\Framework\Console\CommandList">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="disrex_sample_data_themes_list"
+                      xsi:type="object">Disrex\SampleDataThemesCore\Console\Command\ThemeListCommand</item>
+                <item name="disrex_sample_data_themes_deploy"
+                      xsi:type="object">Disrex\SampleDataThemesCore\Console\Command\ThemeDeployCommand</item>
+                <item name="disrex_sample_data_themes_remove"
+                      xsi:type="object">Disrex\SampleDataThemesCore\Console\Command\ThemeRemoveCommand</item>
+            </argument>
+        </arguments>
+    </type>
+</config>
