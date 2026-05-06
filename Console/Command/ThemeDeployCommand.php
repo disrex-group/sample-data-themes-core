@@ -4,12 +4,18 @@ declare(strict_types=1);
 
 namespace Disrex\SampleDataThemesCore\Console\Command;
 
+use Disrex\SampleDataThemesCore\Api\ConfigurableFixtureInterface;
+use Disrex\SampleDataThemesCore\Api\StateAwareFixtureInterface;
 use Disrex\SampleDataThemesCore\Api\ThemeInterface;
 use Disrex\SampleDataThemesCore\Exception\MissingStoreviewException;
 use Disrex\SampleDataThemesCore\Helper\Fixture\PrimaryLocalePromoter;
 use Disrex\SampleDataThemesCore\Helper\Fixture\StoreviewManager;
+use Disrex\SampleDataThemesCore\Model\ConflictAction;
+use Disrex\SampleDataThemesCore\Model\DeployPlan;
+use Disrex\SampleDataThemesCore\Model\FixtureAliasResolver;
 use Disrex\SampleDataThemesCore\Model\FixtureRunner;
 use Disrex\SampleDataThemesCore\Model\ThemeRegistry;
+use Magento\Framework\ObjectManagerInterface;
 use Magento\Framework\App\Cache\TypeListInterface;
 use Magento\Framework\App\State as AppState;
 use Magento\Framework\Indexer\IndexerRegistry;
@@ -20,6 +26,11 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Question\ChoiceQuestion;
+use Symfony\Component\Console\Question\ConfirmationQuestion;
+
+use function Laravel\Prompts\multiselect;
+use function Laravel\Prompts\select;
+use function Laravel\Prompts\text;
 
 class ThemeDeployCommand extends Command
 {
@@ -33,6 +44,12 @@ class ThemeDeployCommand extends Command
     public const OPT_DRY_RUN = 'dry-run';
     public const OPT_FORCE = 'force';
     public const OPT_SKIP_REINDEX = 'skip-reindex';
+    public const OPT_SKIP = 'skip';
+    public const OPT_ONLY = 'only';
+    public const OPT_RESET = 'reset';
+    public const OPT_OPT = 'opt';
+    public const OPT_PROFILE = 'profile';
+    public const OPT_INTERACTIVE = 'interactive';
     public const OPT_PRIMARY_LOCALE = 'primary-locale';
 
     /**
@@ -58,7 +75,9 @@ class ThemeDeployCommand extends Command
         private readonly Registry $magentoRegistry,
         private readonly IndexerRegistry $indexerRegistry,
         private readonly PrimaryLocalePromoter $primaryLocalePromoter,
-        private readonly TypeListInterface $cacheTypeList
+        private readonly TypeListInterface $cacheTypeList,
+        private readonly ObjectManagerInterface $objectManager,
+        private readonly FixtureAliasResolver $aliasResolver
     ) {
         parent::__construct();
     }
@@ -105,7 +124,101 @@ class ThemeDeployCommand extends Command
                 . 'currency, and regenerates URL rewrites. Useful for single-store demo '
                 . 'installs that should render in the chosen language without cookie '
                 . 'switching or path prefixes.'
+            )
+            ->addOption(
+                self::OPT_SKIP,
+                null,
+                InputOption::VALUE_REQUIRED,
+                'Comma-separated fixture short-names to skip (e.g. ProductReviewsFixture,BundleProductFixture).'
+            )
+            ->addOption(
+                self::OPT_ONLY,
+                null,
+                InputOption::VALUE_REQUIRED,
+                'Comma-separated fixture short-names to run exclusively. All others are skipped.'
+            )
+            ->addOption(
+                self::OPT_RESET,
+                null,
+                InputOption::VALUE_REQUIRED,
+                'Comma-separated fixture short-names whose existing data should be cleared before re-import. '
+                . 'Pass "all" to reset every state-aware fixture.'
+            )
+            ->addOption(
+                self::OPT_OPT,
+                null,
+                InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY,
+                'Per-fixture option, in the form FixtureShortName.key=value '
+                . '(e.g. --opt=ProductReviewsFixture.per-product=2-5). Repeat for multiple.'
+            )
+            ->addOption(
+                self::OPT_PROFILE,
+                null,
+                InputOption::VALUE_REQUIRED,
+                'Named preset of fixture selection + options. Looks for '
+                . '_files/profiles/<name>.yaml inside the theme package. '
+                . 'Flags override profile values.'
+            )
+            ->addOption(
+                self::OPT_INTERACTIVE,
+                'i',
+                InputOption::VALUE_NONE,
+                'Force the wizard prompt even when flags are given. The wizard runs '
+                . 'automatically when no flags are passed and the terminal is interactive.'
             );
+
+        // Flat per-fixture option flags (--reviews-per-product=2-5).
+        // Registered dynamically from each registered theme's
+        // ConfigurableFixtureInterface implementations. Building this at
+        // configure() time so they appear in --help.
+        $this->registerFlatOptionFlags();
+    }
+
+    /**
+     * For every registered theme's fixtures that implement
+     * {@see ConfigurableFixtureInterface}, expose each option as a
+     * flat top-level CLI flag named --<alias>-<key>.
+     *
+     * Symfony Console caches the option list at command construction,
+     * so the flags must be added BEFORE parse() runs — i.e. inside
+     * configure(). The trade-off: a fixture's options must be known
+     * when the command boots; describeOptions() therefore can't depend
+     * on runtime state.
+     */
+    private function registerFlatOptionFlags(): void
+    {
+        if ($this->registry->isEmpty()) {
+            return;
+        }
+        foreach ($this->registry->all() as $theme) {
+            $this->aliasResolver->build($theme);
+            foreach ($theme->getFixtures() as $fqcn) {
+                if (!is_subclass_of($fqcn, ConfigurableFixtureInterface::class)) {
+                    continue;
+                }
+                $shortName = $this->runner->shortName($fqcn);
+                $alias = $this->aliasResolver->aliasFor($shortName);
+                $schema = $this->describeOptionsFor($fqcn);
+                foreach ($schema as $key => $meta) {
+                    $flag = sprintf('%s-%s', $alias, $key);
+                    if ($this->getDefinition()->hasOption($flag)) {
+                        // Two themes registered the same alias+key —
+                        // first one wins; later ones reuse the same flag.
+                        continue;
+                    }
+                    $description = is_string($meta['description'] ?? null)
+                        ? (string) $meta['description']
+                        : sprintf('Configures %s.%s', $alias, $key);
+                    $default = $meta['default'] ?? null;
+                    $this->addOption(
+                        $flag,
+                        null,
+                        InputOption::VALUE_REQUIRED,
+                        $description . (is_scalar($default) ? sprintf(' (default: %s)', (string) $default) : '')
+                    );
+                }
+            }
+        }
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -127,18 +240,18 @@ class ThemeDeployCommand extends Command
             return Command::FAILURE;
         }
 
-        if ($input->getOption(self::OPT_DRY_RUN)) {
-            $output->writeln('<comment>Dry run — fixtures listed but not executed:</comment>');
-            foreach ($theme->getFixtures() as $cls) {
-                $output->writeln('  - ' . $cls);
-            }
+        $plan = $this->buildDeployPlan($input, $output, $theme);
+
+        if ($plan->dryRun || $input->getOption(self::OPT_DRY_RUN)) {
+            $output->writeln('<comment>Dry run — fixture plan:</comment>');
+            $this->renderPlanPreview($plan, $theme, $output);
             return Command::SUCCESS;
         }
 
         $this->signalDeployContext($input, $theme, $locales);
 
         $output->writeln(sprintf('<info>Deploying theme:</info> %s', $theme->getCode()));
-        $result = $this->runner->run($theme, $output);
+        $result = $this->runner->run($theme, $output, $plan);
 
         $this->summarize($result, $output);
 
@@ -315,6 +428,7 @@ class ThemeDeployCommand extends Command
         $question->setErrorMessage('Theme "%s" is not registered.');
 
         /** @var QuestionHelper $helper */
+        /** @var QuestionHelper $helper */
         $helper = $this->getHelper('question');
         $selected = (string) $helper->ask($input, $output, $question);
         return $this->registry->get($selected);
@@ -404,5 +518,455 @@ class ThemeDeployCommand extends Command
                 $output->writeln(sprintf('  - %s: %s', $failure['class'], $failure['message']));
             }
         }
+        if ($result->getSkipped() !== []) {
+            $output->writeln('<comment>Skipped:</comment>');
+            foreach ($result->getSkipped() as $s) {
+                $output->writeln(sprintf('  - %s (%s)', $s['class'], $s['reason']));
+            }
+        }
+    }
+
+    /**
+     * Build a DeployPlan from (in order of precedence):
+     *   1. profile YAML
+     *   2. CLI flags (--skip / --only / --reset / --opt=fixture.key=val)
+     *   3. interactive prompts (only when -i / --interactive is given)
+     */
+    private function buildDeployPlan(
+        InputInterface $input,
+        OutputInterface $output,
+        ThemeInterface $theme
+    ): DeployPlan {
+        $this->aliasResolver->build($theme);
+
+        // ---- 1. Profile defaults --------------------------------------
+        $profile = $this->loadProfile($input, $theme, $output);
+
+        $skip = $this->resolveAll($profile['skip'] ?? [], $output);
+        $only = isset($profile['only']) ? $this->resolveAll($profile['only'], $output) : null;
+        $resetTargets = $this->resolveAll($profile['reset'] ?? [], $output);
+        $options = $this->resolveOptionKeys($profile['options'] ?? [], $output);
+
+        // ---- 2. Flag overrides ----------------------------------------
+        if ($v = $input->getOption(self::OPT_SKIP)) {
+            $skip = $this->resolveAll(
+                array_filter(array_map('trim', explode(',', (string) $v))),
+                $output
+            );
+        }
+        if ($v = $input->getOption(self::OPT_ONLY)) {
+            $only = $this->resolveAll(
+                array_filter(array_map('trim', explode(',', (string) $v))),
+                $output
+            );
+        }
+        if ($v = $input->getOption(self::OPT_RESET)) {
+            $resetTargets = array_filter(array_map('trim', explode(',', (string) $v)));
+            // "all" stays special and is expanded below.
+            $resetTargets = array_map(
+                fn (string $id) => $id === 'all' ? 'all' : ($this->aliasResolver->resolve($id) ?? $id),
+                $resetTargets
+            );
+        }
+        // Dot-notation per-fixture options (legacy + escape-hatch)
+        foreach ((array) $input->getOption(self::OPT_OPT) as $kv) {
+            // <fixture-id>.<key>=<value> — fixture-id may be alias or short name
+            if (preg_match('/^([\w-]+)\.([\w-]+)=(.*)$/', (string) $kv, $m)) {
+                $resolved = $this->aliasResolver->resolve($m[1]) ?? $m[1];
+                $options[$resolved][$m[2]] = $m[3];
+            } else {
+                $output->writeln(sprintf(
+                    '<comment>Ignoring malformed --opt: %s (expected fixture.key=value)</comment>',
+                    $kv
+                ));
+            }
+        }
+        // Flat per-fixture option flags (e.g. --reviews-per-product=2-5)
+        foreach ($this->collectFlatOptions($input, $theme) as $shortName => $opts) {
+            foreach ($opts as $key => $value) {
+                $options[$shortName][$key] = $value;
+            }
+        }
+
+        // ---- 3. Wizard layer ------------------------------------------
+        // Auto-trigger when no selection/option/profile flag was given
+        // AND the input is interactive. Explicit --interactive forces it
+        // even when flags are set.
+        if ($this->shouldRunWizard($input, $skip, $only, $resetTargets, $options)) {
+            [$skip, $only, $resetTargets, $options] =
+                $this->runWizard($input, $output, $theme, $skip, $only, $resetTargets, $options);
+        }
+
+        // ---- Resolve "all" reset alias --------------------------------
+        $allFixtureNames = array_map(
+            fn ($cls) => $this->runner->shortName($cls),
+            $theme->getFixtures()
+        );
+        if (in_array('all', $resetTargets, true)) {
+            $resetTargets = $allFixtureNames;
+        }
+
+        $conflictActions = [];
+        foreach ($resetTargets as $name) {
+            $conflictActions[$name] = ConflictAction::Reset;
+        }
+
+        return new DeployPlan(
+            skip: array_values(array_unique($skip)),
+            only: $only !== null ? array_values($only) : null,
+            conflictActions: $conflictActions,
+            options: $options,
+            dryRun: (bool) $input->getOption(self::OPT_DRY_RUN),
+        );
+    }
+
+    /**
+     * Translate every entry in a list through the alias resolver,
+     * emitting a warning for any unknown identifier.
+     *
+     * @param array<int, string> $identifiers
+     * @return array<int, string>
+     */
+    private function resolveAll(array $identifiers, OutputInterface $output): array
+    {
+        $out = [];
+        foreach ($identifiers as $id) {
+            $shortName = $this->aliasResolver->resolve($id);
+            if ($shortName === null) {
+                $output->writeln(sprintf(
+                    '<comment>Unknown fixture identifier "%s" — left as-is.</comment>',
+                    $id
+                ));
+                $out[] = $id;
+                continue;
+            }
+            $out[] = $shortName;
+        }
+        return $out;
+    }
+
+    /**
+     * Translate the keys of a profile's `options` map (which may use
+     * aliases) into canonical short class names.
+     *
+     * @param array<string, array<string, scalar>> $optionsByAlias
+     * @return array<string, array<string, scalar>>
+     */
+    private function resolveOptionKeys(array $optionsByAlias, OutputInterface $output): array
+    {
+        $out = [];
+        foreach ($optionsByAlias as $alias => $opts) {
+            $shortName = $this->aliasResolver->resolve($alias) ?? $alias;
+            $out[$shortName] = array_merge($out[$shortName] ?? [], $opts);
+        }
+        return $out;
+    }
+
+    /**
+     * Walk the registered flat-flag namespace (--<alias>-<key>) and
+     * return the values keyed by short class name.
+     *
+     * @return array<string, array<string, scalar>>
+     */
+    private function collectFlatOptions(InputInterface $input, ThemeInterface $theme): array
+    {
+        $out = [];
+        foreach ($theme->getFixtures() as $fqcn) {
+            if (!is_subclass_of($fqcn, ConfigurableFixtureInterface::class)) {
+                continue;
+            }
+            $shortName = $this->runner->shortName($fqcn);
+            $alias = $this->aliasResolver->aliasFor($shortName);
+            $schema = $this->describeOptionsFor($fqcn);
+            foreach ($schema as $key => $_meta) {
+                $flag = sprintf('%s-%s', $alias, $key);
+                if (!$input->hasOption($flag)) {
+                    continue;
+                }
+                $value = $input->getOption($flag);
+                if ($value === null || $value === '') {
+                    continue;
+                }
+                $out[$shortName][$key] = $value;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Did the user supply ANY selection/option/profile signal? If not
+     * AND the input is interactive (TTY, no -n), we drop into the
+     * wizard. If --interactive is set explicitly, we always run it.
+     *
+     * @param array<int, string> $skip
+     * @param array<int, string>|null $only
+     * @param array<int, string> $reset
+     * @param array<string, array<string, scalar>> $options
+     */
+    private function shouldRunWizard(
+        InputInterface $input,
+        array $skip,
+        ?array $only,
+        array $reset,
+        array $options
+    ): bool {
+        if ($input->getOption(self::OPT_INTERACTIVE)) {
+            return true;
+        }
+        if (!$input->isInteractive()) {
+            return false;
+        }
+        // Any flag-driven selection / option present?
+        if ($skip !== [] || $only !== null || $reset !== [] || $options !== []) {
+            return false;
+        }
+        if ($input->getOption(self::OPT_PROFILE)) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    private function describeOptionsFor(string $fixtureClass): array
+    {
+        try {
+            $instance = $this->objectManager->create($fixtureClass);
+        } catch (\Throwable) {
+            return [];
+        }
+        if (!$instance instanceof ConfigurableFixtureInterface) {
+            return [];
+        }
+        try {
+            return $instance->describeOptions();
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * @return array{
+     *     skip?: array<string>,
+     *     only?: array<string>,
+     *     reset?: array<string>,
+     *     options?: array<string, array<string, scalar>>
+     * }
+     */
+    private function loadProfile(
+        InputInterface $input,
+        ThemeInterface $theme,
+        OutputInterface $output
+    ): array {
+        $name = $input->getOption(self::OPT_PROFILE);
+        if (!$name) {
+            return [];
+        }
+        $path = $theme->getFixturesPath() . '/profiles/' . $name . '.yaml';
+        if (!is_readable($path)) {
+            $output->writeln(sprintf(
+                '<comment>Profile "%s" not found at %s — using built-in defaults.</comment>',
+                $name,
+                $path
+            ));
+            return [];
+        }
+        // Light-weight YAML reader: allow simple key:value and key:[a, b] —
+        // pulling in symfony/yaml as a hard dep just for profiles felt
+        // disproportionate. If profiles grow more complex we can swap in.
+        $yaml = @yaml_parse_file($path);
+        if (!is_array($yaml)) {
+            $output->writeln(sprintf(
+                '<comment>Profile "%s" failed to parse (need ext-yaml) — ignored.</comment>',
+                $name
+            ));
+            return [];
+        }
+        $output->writeln(sprintf('<info>Profile loaded:</info> %s', $name));
+        return $yaml;
+    }
+
+    /**
+     * Wizard: walks the operator through fixture selection, per-fixture
+     * conflict actions and per-option configuration. Names are
+     * displayed using the curated aliases (reviews, links, simple, …)
+     * to match the rest of the CLI.
+     *
+     * Three sub-prompts:
+     *   1. "Run all?" gate — accepting yes returns immediately with
+     *      the unchanged skip/only/reset/options arrays. Common case
+     *      stays one Enter key.
+     *   2. Multi-select fixture picker — only shown if the user said
+     *      no to (1).
+     *   3. Per-fixture conflict prompt + per-option prompt — shown
+     *      only for fixtures that have existing data and/or expose
+     *      `describeOptions()`.
+     *
+     * @param array<string> $skip
+     * @param array<string>|null $only
+     * @param array<string> $reset
+     * @param array<string, array<string, scalar>> $options
+     * @return array{0: array<string>, 1: array<string>|null, 2: array<string>, 3: array<string, array<string, scalar>>}
+     */
+    private function runWizard(
+        InputInterface $input,
+        OutputInterface $output,
+        ThemeInterface $theme,
+        array $skip,
+        ?array $only,
+        array $reset,
+        array $options
+    ): array {
+        $output->writeln('');
+        $output->writeln('<info>Wizard:</info> let\'s figure out what to deploy.');
+        $output->writeln('');
+
+        $allFixtures = $theme->getFixtures();
+        $shortNames = array_map(fn ($cls) => $this->runner->shortName($cls), $allFixtures);
+        $aliases = array_map(fn ($n) => $this->aliasResolver->aliasFor($n), $shortNames);
+
+        // 1. Full vs Customised — top-level decision.
+        $mode = select(
+            label: 'How would you like to deploy?',
+            options: [
+                'full' => 'Full — run every fixture with default options',
+                'customised' => 'Customised — pick fixtures, conflict actions and per-fixture options',
+            ],
+            default: 'full',
+        );
+        if ($mode === 'full') {
+            $output->writeln('');
+            return [$skip, $only, $reset, $options];
+        }
+
+        // 2. Multi-select fixture picker (true checkbox UX via laravel/prompts).
+        // Build a label → alias map and pre-tick everything not in the
+        // current $skip set.
+        $optionsMap = [];
+        $defaultTicked = [];
+        foreach ($aliases as $i => $alias) {
+            $existing = $this->maybeCount($allFixtures[$i]);
+            $label = $existing !== null && $existing > 0
+                ? sprintf('%s (%d existing)', $alias, $existing)
+                : $alias;
+            $optionsMap[$alias] = $label;
+            if (!in_array($shortNames[$i], $skip, true)) {
+                $defaultTicked[] = $alias;
+            }
+        }
+
+        /** @var array<int, string> $selectedAliases */
+        $selectedAliases = multiselect(
+            label: 'Which fixtures should run? (Space to toggle, Enter to confirm)',
+            options: $optionsMap,
+            default: $defaultTicked,
+            scroll: 15,
+            required: false,
+            hint: 'Use ↑/↓ to move, Space to toggle, A to toggle all, Enter to confirm.',
+        );
+
+        $selectedShortNames = [];
+        foreach ($selectedAliases as $a) {
+            $resolved = $this->aliasResolver->resolve((string) $a);
+            if ($resolved !== null) {
+                $selectedShortNames[] = $resolved;
+            }
+        }
+        $only = $selectedShortNames;
+        $skip = array_values(array_diff($shortNames, $selectedShortNames));
+
+        // 3. Per-fixture conflict + option prompts for selected fixtures.
+        foreach ($allFixtures as $cls) {
+            $shortName = $this->runner->shortName($cls);
+            if (!in_array($shortName, $selectedShortNames, true)) {
+                continue;
+            }
+            $alias = $this->aliasResolver->aliasFor($shortName);
+            $existing = $this->maybeCount($cls);
+
+            if ($existing !== null && $existing > 0) {
+                $action = select(
+                    label: sprintf('%s already has %d entries — what should I do?', $alias, $existing),
+                    options: [
+                        'merge' => 'Merge — leave existing, run execute() on top',
+                        'reset' => 'Reset — clear() existing first, then re-import',
+                        'skip' => 'Skip — leave it untouched, don\'t run',
+                    ],
+                    default: 'merge',
+                );
+                if ($action === 'reset') {
+                    $reset[] = $shortName;
+                } elseif ($action === 'skip') {
+                    $skip[] = $shortName;
+                    $only = array_values(array_diff($only, [$shortName]));
+                    continue;
+                }
+            }
+
+            // Walk describeOptions() for configurable fixtures and prompt
+            // each option with the current value as the default.
+            $schema = $this->describeOptionsFor($cls);
+            foreach ($schema as $key => $meta) {
+                $current = $options[$shortName][$key] ?? ($meta['default'] ?? '');
+                $value = text(
+                    label: sprintf('%s • %s', $alias, $key),
+                    placeholder: is_scalar($current) ? (string) $current : '',
+                    default: is_scalar($current) ? (string) $current : '',
+                    hint: is_string($meta['description'] ?? null) ? (string) $meta['description'] : '',
+                );
+                if ($value !== '' && (string) $value !== (string) $current) {
+                    $options[$shortName][$key] = (string) $value;
+                }
+            }
+        }
+
+        return [$skip, $only, $reset, $options];
+    }
+
+    /**
+     * Best-effort current-count lookup for a fixture. Returns null if
+     * the fixture isn't state-aware OR if instantiating it failed.
+     */
+    private function maybeCount(string $fixtureClass): ?int
+    {
+        try {
+            $instance = $this->objectManager->create($fixtureClass);
+        } catch (\Throwable) {
+            return null;
+        }
+        if (!$instance instanceof StateAwareFixtureInterface) {
+            return null;
+        }
+        try {
+            return $instance->count();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function renderPlanPreview(DeployPlan $plan, ThemeInterface $theme, OutputInterface $output): void
+    {
+        $this->aliasResolver->build($theme);
+        $output->writeln('');
+        $output->writeln(sprintf('  %-20s  %-9s  %-7s  %s', 'Fixture', 'Existing', 'Action', 'Options'));
+        $output->writeln('  ' . str_repeat('─', 70));
+        foreach ($theme->getFixtures() as $cls) {
+            $shortName = $this->runner->shortName($cls);
+            $alias = $this->aliasResolver->aliasFor($shortName);
+            $existing = $this->maybeCount($cls);
+            $existingStr = $existing !== null ? (string) $existing : '—';
+            if (!$plan->shouldRun($shortName)) {
+                $action = 'skip';
+            } else {
+                $action = $existing !== null && $existing > 0
+                    ? $plan->conflictAction($shortName)->value
+                    : 'run';
+            }
+            $opts = $plan->optionsFor($shortName);
+            $optsStr = $opts === [] ? '' : http_build_query($opts, '', ', ');
+            $output->writeln(sprintf('  %-20s  %-9s  %-7s  %s', $alias, $existingStr, $action, $optsStr));
+        }
+        $output->writeln('');
     }
 }

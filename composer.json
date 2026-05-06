@@ -13,6 +13,7 @@
     ],
     "require": {
         "php": "~8.2.0 || ~8.3.0 || ~8.4.0",
+        "laravel/prompts": "^0.3",
         "magento/framework": "^103.0",
         "magento/module-catalog": "^104.0",
         "magento/module-eav": "^102.1",

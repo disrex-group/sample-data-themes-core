@@ -16,6 +16,9 @@ class RunResult
     /** @var array<int, array{class: string, message: string}> */
     private array $failures = [];
 
+    /** @var array<int, array{class: string, reason: string}> */
+    private array $skipped = [];
+
     public function __construct(private readonly string $themeCode)
     {
     }
@@ -33,6 +36,17 @@ class RunResult
     public function addFailure(string $fixtureClass, string $message): void
     {
         $this->failures[] = ['class' => $fixtureClass, 'message' => $message];
+    }
+
+    public function addSkipped(string $fixtureClass, string $reason): void
+    {
+        $this->skipped[] = ['class' => $fixtureClass, 'reason' => $reason];
+    }
+
+    /** @return array<int, array{class: string, reason: string}> */
+    public function getSkipped(): array
+    {
+        return $this->skipped;
     }
 
     /** @return array<int, array{class: string, label: string}> */
